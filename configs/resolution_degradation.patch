@@ -1,0 +1,424 @@
+diff --git a/dataloader/PHDataset.py b/dataloader/PHDataset.py
+index b7b1f19..d2705bf 100644
+--- a/dataloader/PHDataset.py
++++ b/dataloader/PHDataset.py
+@@ -1,90 +1,368 @@
+ import os
++
+ import numpy as np
+ import rasterio
+ import torch
++import torch.nn.functional as F
+ from torch.utils.data import Dataset
+ 
+ 
+ def read_tif(patch_path):
+-    tif = rasterio.open(patch_path)
+-    tif_array = tif.read().astype(np.float32)
+-    return torch.tensor(tif_array)
++    """Lê um GeoTIFF e retorna um tensor float32 [C, H, W]."""
++    with rasterio.open(patch_path) as tif:
++        tif_array = tif.read().astype(np.float32)
++
++    return torch.from_numpy(tif_array)
++
++
++def degrade_spatial_resolution(
++    image,
++    valid_mask,
++    source_gsd,
++    target_gsd,
++):
++    """
++    Simula uma resolução espacial mais baixa e retorna a imagem
++    ao tamanho original exigido pela rede.
++
++    Etapas:
++        1. redução por média de área;
++        2. ampliação bilinear para o tamanho original.
++
++    Args:
++        image:
++            Tensor float32 no formato [C, H, W].
++
++        valid_mask:
++            Tensor booleano no formato [1, H, W].
++            True indica um pixel válido.
++
++        source_gsd:
++            Resolução espacial original em metros por pixel.
++
++        target_gsd:
++            Resolução espacial que será simulada.
++
++    Returns:
++        Tensor [C, H, W] com o mesmo tamanho da entrada.
++    """
++    if image.ndim != 3:
++        raise ValueError(
++            "A imagem deve possuir formato [C, H, W]. "
++            f"Formato recebido: {tuple(image.shape)}"
++        )
++
++    if valid_mask.ndim == 2:
++        valid_mask = valid_mask.unsqueeze(0)
++
++    if valid_mask.ndim != 3 or valid_mask.shape[0] != 1:
++        raise ValueError(
++            "A máscara deve possuir formato [1, H, W]. "
++            f"Formato recebido: {tuple(valid_mask.shape)}"
++        )
++
++    if image.shape[-2:] != valid_mask.shape[-2:]:
++        raise ValueError(
++            "A imagem e a máscara devem possuir as mesmas "
++            "dimensões espaciais."
++        )
++
++    if source_gsd <= 0 or target_gsd <= 0:
++        raise ValueError(
++            "source_gsd e target_gsd devem ser maiores que zero."
++        )
++
++    # A resolução original não sofre nenhuma alteração.
++    if target_gsd == source_gsd:
++        return image
++
++    if target_gsd < source_gsd:
++        raise ValueError(
++            "target_gsd não pode ser menor que source_gsd. "
++            "Esse procedimento simula apenas perda de resolução."
++        )
++
++    _, original_height, original_width = image.shape
++
++    reduced_height = max(
++        1,
++        round(original_height * source_gsd / target_gsd),
++    )
++
++    reduced_width = max(
++        1,
++        round(original_width * source_gsd / target_gsd),
++    )
++
++    # F.interpolate exige o formato [N, C, H, W].
++    image_batch = image.unsqueeze(0)
++
++    mask_batch = (
++        valid_mask
++        .to(dtype=image.dtype, device=image.device)
++        .unsqueeze(0)
++    )
++
++    epsilon = 1e-6
++
++    # ---------------------------------------------------------
++    # 1. Redução espacial por média de área
++    # ---------------------------------------------------------
++    #
++    # A imagem é multiplicada pela máscara para que pixels
++    # NoData não participem da média.
++    reduced_weighted_data = F.interpolate(
++        image_batch * mask_batch,
++        size=(reduced_height, reduced_width),
++        mode="area",
++    )
++
++    reduced_valid_fraction = F.interpolate(
++        mask_batch,
++        size=(reduced_height, reduced_width),
++        mode="area",
++    )
++
++    reduced_image = (
++        reduced_weighted_data
++        / reduced_valid_fraction.clamp_min(epsilon)
++    )
++
++    # ---------------------------------------------------------
++    # 2. Ampliação bilinear ao tamanho original
++    # ---------------------------------------------------------
++    #
++    # A fração válida também é interpolada para impedir que
++    # áreas NoData contaminem pixels vizinhos.
++    restored_weighted_data = F.interpolate(
++        reduced_image * reduced_valid_fraction,
++        size=(original_height, original_width),
++        mode="bilinear",
++        align_corners=False,
++    )
++
++    restored_valid_fraction = F.interpolate(
++        reduced_valid_fraction,
++        size=(original_height, original_width),
++        mode="bilinear",
++        align_corners=False,
++    )
++
++    restored_image = (
++        restored_weighted_data
++        / restored_valid_fraction.clamp_min(epsilon)
++    ).squeeze(0)
++
++    # Mantém como zero os pixels originalmente inválidos.
++    expanded_valid_mask = valid_mask.expand_as(restored_image)
++
++    restored_image = restored_image.masked_fill(
++        ~expanded_valid_mask,
++        0.0,
++    )
++
++    return restored_image
+ 
+ 
+ def get_paths(in_dir, split):
+-    path_file = os.path.join(in_dir, split + '.txt')
++    path_file = os.path.join(in_dir, split + ".txt")
+     path_list = []
+-    with open(path_file) as f:
+-        for line in f:
++
++    with open(path_file, encoding="utf-8") as file:
++        for line in file:
+             line = line.strip()
+-            path_list.append(os.path.join(in_dir, line))
++
++            if line:
++                path_list.append(os.path.join(in_dir, line))
++
+     return path_list
+ 
+ 
+ def build_city2region():
+     region_dict = {
+-        'EU': ['Barcelona', 'London', 'Madrid', 'Vienna'],
+-        'NA': ['Boston', 'LasVegas', 'LosAngeles', 'Sacramento', 'SaltLakeCity'],
+-        'AU': ['Adelaide', 'Melbourne', 'Perth'],
+-        'AS': ['Ankara', 'Beijing', 'Liuzhou', 'Osaka', 'Tianjin'],
+-        'SA': ['Barranquilla', 'RiodeJaneiro', 'Santiago', 'SaoPaulo'],
+-        'AF': ['Alexandria', 'CapeTown', 'Constantine', 'Ouargla', 'Tunis']
++        "EU": ["Barcelona", "London", "Madrid", "Vienna"],
++        "NA": [
++            "Boston",
++            "LasVegas",
++            "LosAngeles",
++            "Sacramento",
++            "SaltLakeCity",
++        ],
++        "AU": ["Adelaide", "Melbourne", "Perth"],
++        "AS": ["Ankara", "Beijing", "Liuzhou", "Osaka", "Tianjin"],
++        "SA": [
++            "Barranquilla",
++            "RiodeJaneiro",
++            "Santiago",
++            "SaoPaulo",
++        ],
++        "AF": [
++            "Alexandria",
++            "CapeTown",
++            "Constantine",
++            "Ouargla",
++            "Tunis",
++        ],
+     }
+ 
+     city2region = {}
++
+     for region, cities in region_dict.items():
+         for city in cities:
+             city2region[city] = region
+-    strong_cities = {city for city, region in city2region.items() if region in ['EU', 'NA', 'AU']}
++
++    strong_cities = {
++        city
++        for city, region in city2region.items()
++        if region in ["EU", "NA", "AU"]
++    }
++
+     return strong_cities
+ 
+ 
+ class PHDataset(Dataset):
+-    def __init__(self, opt, split='train'):
++    def __init__(self, opt, split="train"):
+         self.path_list = get_paths(opt.data_dir, split)
+         self.mode = opt.mode
+         self.norm_path = opt.norm_path
+         self.fp_thresh = opt.fp_thresh
+ 
+-        if opt.norm_path is not None:
+-            stats = np.load(opt.norm_path)
+-            self.OPT_MIN_GLOBAL = float(stats['opt_min'])
+-            self.OPT_MAX_GLOBAL = float(stats['opt_max'])
+-            self.NODATA_VALUE = float(stats['nodata_value'])
+-            self.OPT_RANGE = self.OPT_MAX_GLOBAL - self.OPT_MIN_GLOBAL
++        self.source_gsd = float(
++            getattr(opt, "source_gsd", 4.75)
++        )
++
++        self.target_gsd = float(
++            getattr(opt, "target_gsd", 4.75)
++        )
++
++        if self.source_gsd <= 0:
++            raise ValueError(
++                "source_gsd deve ser maior que zero."
++            )
++
++        if self.target_gsd < self.source_gsd:
++            raise ValueError(
++                "target_gsd deve ser maior ou igual a source_gsd."
++            )
++
++        # Valor padrão usado pelo PHDataset.
++        self.NODATA_VALUE = 0.0
++
++        if self.norm_path is not None:
++            stats = np.load(self.norm_path)
++
++            self.OPT_MIN_GLOBAL = float(
++                stats["opt_min"]
++            )
++
++            self.OPT_MAX_GLOBAL = float(
++                stats["opt_max"]
++            )
++
++            if "nodata_value" in stats:
++                self.NODATA_VALUE = float(
++                    stats["nodata_value"]
++                )
++
++            self.OPT_RANGE = (
++                self.OPT_MAX_GLOBAL
++                - self.OPT_MIN_GLOBAL
++            )
++
+             if self.OPT_RANGE == 0:
+                 self.OPT_RANGE = 1e-6
+ 
++        if self.target_gsd > self.source_gsd:
++            print(
++                f"PHDataset [{split}]: simulando "
++                f"{self.source_gsd:g} m/pixel -> "
++                f"{self.target_gsd:g} m/pixel"
++            )
++        else:
++            print(
++                f"PHDataset [{split}]: usando resolução original "
++                f"de {self.source_gsd:g} m/pixel"
++            )
++
+     def __getitem__(self, index):
+         optical_path = self.path_list[index]
+-        height_path = self.path_list[index].replace('optical_patches', 'height_patches')
++
++        height_path = optical_path.replace(
++            "optical_patches",
++            "height_patches",
++        )
++
+         optical = read_tif(optical_path)
+         height = read_tif(height_path)
+ 
+-        optical_valid_mask = torch.ones_like(optical, dtype=torch.bool)
+-        height_valid_mask = torch.ones_like(height, dtype=torch.bool)
++        # Máscaras originais, antes de qualquer processamento.
++        optical_band_valid_mask = (
++            optical != self.NODATA_VALUE
++        )
+ 
++        height_valid_mask = (
++            height != self.NODATA_VALUE
++        )
++
++        # Usa uma máscara comum entre as sete bandas.
++        #
++        # O pixel só é considerado válido quando todas as bandas
++        # possuem informação válida.
++        optical_common_valid_mask = torch.all(
++            optical_band_valid_mask,
++            dim=0,
++            keepdim=True,
++        )
++
++        # Degrada somente a imagem óptica.
++        #
++        # O mapa de altura continua com a resolução e os valores
++        # originais, pois é o alvo do modelo.
++        optical = degrade_spatial_resolution(
++            image=optical,
++            valid_mask=optical_common_valid_mask,
++            source_gsd=self.source_gsd,
++            target_gsd=self.target_gsd,
++        )
++
++        # Todas as bandas passam a compartilhar a máscara comum.
++        optical_valid_mask = (
++            optical_common_valid_mask.expand_as(optical)
++        )
++
++        # A degradação ocorre antes da normalização.
+         if self.norm_path is not None:
+-            optical_valid_mask = optical != self.NODATA_VALUE
+-            height_valid_mask = height != self.NODATA_VALUE
+-            optical = (optical - self.OPT_MIN_GLOBAL) / self.OPT_RANGE
+-            optical[~optical_valid_mask] = torch.tensor(0, dtype=optical.dtype)
+-            height[~height_valid_mask] = torch.tensor(0, dtype=height.dtype)
++            optical = (
++                optical - self.OPT_MIN_GLOBAL
++            ) / self.OPT_RANGE
++
++            optical = optical.masked_fill(
++                ~optical_valid_mask,
++                0.0,
++            )
++
++            height = height.masked_fill(
++                ~height_valid_mask,
++                0.0,
++            )
+ 
+         if height.ndim == 2:
+             height = height[None, :, :]
++
+         if height_valid_mask.ndim == 2:
+             height_valid_mask = height_valid_mask[None, :, :]
+ 
+-        if self.mode == 'seg':
+-            height = (height > self.fp_thresh).float()
++        if self.mode == "seg":
++            height = (
++                height > self.fp_thresh
++            ).float()
+ 
+         return {
+-            'optical': optical,
+-            'height': height,
+-            'optical_valid_mask': optical_valid_mask[0:1, :, :],
+-            'height_valid_mask': height_valid_mask,
+-            'height_path': height_path,
++            "optical": optical,
++            "height": height,
++            "optical_valid_mask": optical_common_valid_mask,
++            "height_valid_mask": height_valid_mask,
++            "height_path": height_path,
+         }
+ 
+     def __len__(self):
+diff --git a/options/base_options.py b/options/base_options.py
+index 543b75a..a5d1926 100644
+--- a/options/base_options.py
++++ b/options/base_options.py
+@@ -64,6 +64,10 @@ class BaseOptions:
+         parser.add_argument('--prob_height_head_act', type=str, default='linear', choices=['linear', 'sigmoid_range'])
+ 
+         parser.add_argument('--data_dir', type=str, default=r'E:/HeightMap/Samples/256_World')
++		
++        parser.add_argument("--source_gsd", type=float, default=4.75, help="Resolução espacial original em metros por pixel.")
++
++        parser.add_argument("--target_gsd", type=float, default=4.75, help=("Resolução espacial simulada em metros por pixel. " "Use 4.75, 10, 15 ou 30."))
+         parser.add_argument('--n_workers', type=int, default=4)
+         parser.add_argument('--batch_size', type=int, default=8)
+ 
